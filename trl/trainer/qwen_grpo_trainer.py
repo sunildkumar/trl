@@ -767,16 +767,3 @@ class QwenGRPOTrainer(Trainer):
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
 
-
-
-def print_random_alphabet(n:int=4) -> None:
-    """Print the uppercase alphabet in a random order with four spaces between each letter.
-    For the secret-decoder-ring task.
-    """
-    import random
-    import string
-    letters = list(string.ascii_uppercase)
-    random.shuffle(letters)
-    js = " " * n
-    print(js.join(letters[0:13]))
-    print(js.join(letters[13:]))
