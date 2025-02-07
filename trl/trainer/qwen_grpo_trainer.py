@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+VERBOSE = False
+
 import os
 import textwrap
 import warnings
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 from unittest.mock import patch
 import copy
@@ -64,6 +67,70 @@ if is_wandb_available():
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
+
+@dataclass
+class ToolDefinition:
+    """Basic metadata that the trainer needs to know about the tools."""
+    stop_string: str
+    call_tool: Callable[[torch.Tensor], torch.Tensor]
+
+    def completion_has_tool_call(self, completion_str: str) -> bool:
+        """Check if the completion has a tool call."""
+        return self.stop_string in completion_str
+
+
+class SingleConversationWithTools:
+    """Keeps track of the prompt, and knows how to put together the partial responses and the tool call responses."""
+
+    def __init__(self, prompt_inputs: dict[str, torch.Tensor], tool_defn: ToolDefinition, processing_class: PreTrainedTokenizerBase):
+        self.prompt_inputs = prompt_inputs
+        self.tool_defn = tool_defn
+        self.response = []
+        self.processing_class = processing_class
+
+    def process_response(self, prompt_completion_ids: torch.Tensor) -> bool:
+        """Adds the response to the conversation, including calling the tool if necessary.
+        Returns True if there was a tool call, and the conversation should continue.
+        Returns False if there was no tool call, and the conversation is complete.
+        """
+        self.response.append(prompt_completion_ids)
+        prompt_completion_str = self.processing_class.tokenizer.decode(prompt_completion_ids[0], skip_special_tokens=True)  
+        # Check if the stop string is in the completions
+        # We need to convert the tensor to a string.
+        if self.tool_defn.completion_has_tool_call(prompt_completion_str):
+            tool_response_str = self.tool_defn.call_tool(prompt_completion_str)
+            tool_response_ids_list = self.processing_class.tokenizer.encode(tool_response_str, add_special_tokens=False)
+            tool_response_ids = torch.tensor(tool_response_ids_list, device=prompt_completion_ids.device)  # [L]
+            tool_response_ids = tool_response_ids[None, :]  # [1, L]
+            self.response.append(tool_response_ids)
+            self.prompt_inputs = self._add_response_to_prompt_inputs(self.prompt_inputs, prompt_completion_ids)
+            self.prompt_inputs = self._add_response_to_prompt_inputs(self.prompt_inputs, tool_response_ids)
+            # Note: we're gonna have to figure out images.
+            return True
+        else:
+            # No tool call, so we're done.
+            return False
+
+    def _add_response_to_prompt_inputs(self, prompt_inputs: dict[str, torch.Tensor], response: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Add the response to the prompt inputs."""
+        if VERBOSE:
+            addition_str = self.processing_class.decode(response[0])
+            print(f"Adding response: {addition_str}")
+        prompt_inputs["input_ids"] = torch.cat([prompt_inputs["input_ids"], response], dim=1)
+        ones = torch.ones_like(response, device=response.device)
+        prompt_inputs["attention_mask"] = torch.cat([prompt_inputs["attention_mask"], ones], dim=1)
+        return prompt_inputs
+
+
+    def get_just_completion_ids(self) -> torch.Tensor:
+        """Returns the response (not including the prompt) as a tensor."""
+        # String together all the response tensors on their long dimension.
+        return torch.cat(self.response, dim=1)
+
+    def get_prompt_completion_ids(self) -> torch.Tensor:
+        """Returns the prompt and completion as a tensor.  The full completion includes the prompt and the response."""
+        out = torch.cat([self.prompt_inputs["input_ids"], self.get_just_completion_ids()], dim=1)
+        return out
 
 class QwenGRPOTrainer(Trainer):
     """
@@ -164,6 +231,7 @@ class QwenGRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
+        tool_defn: Optional[ToolDefinition] = None,
     ):
         # Args
         if args is None:
@@ -219,6 +287,8 @@ class QwenGRPOTrainer(Trainer):
                     reward_func, num_labels=1, **model_init_kwargs
                 )
         self.reward_funcs = reward_funcs
+
+        self.tool_defn = tool_defn
 
         # Reward processing class
         if reward_processing_classes is None:
@@ -330,12 +400,19 @@ class QwenGRPOTrainer(Trainer):
             # synchronize all processes after vLLM has been fully initialized.
             self.accelerator.wait_for_everyone()
         else:
+            # No vLLM, so we use the regular generation config
+
+            stop_strings = None
+            if self.tool_defn:
+                stop_strings = [self.tool_defn.stop_string]
+
             self.generation_config = GenerationConfig(
                 max_new_tokens=self.max_completion_length,
                 do_sample=True,
                 temperature=args.temperature,
                 num_return_sequences=self.num_generations,
                 pad_token_id=processing_class.tokenizer.pad_token_id,
+                stop_strings=stop_strings,
             )
 
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
@@ -368,6 +445,59 @@ class QwenGRPOTrainer(Trainer):
     # Since we preprocess the data in `compute_loss`, we need to override this method to skip this step.
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         return inputs
+
+    def _generate_completion(
+        self, model: PreTrainedModel, prompt_inputs: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Generate completion(s) using the model."""
+        temp_generation_config = copy.deepcopy(self.generation_config)
+        temp_generation_config.num_return_sequences = 1
+        prompt_completion_ids = model.generate(
+                **prompt_inputs,
+                generation_config=temp_generation_config,
+                tokenizer=self.processing_class.tokenizer,
+        )
+        return prompt_completion_ids
+
+    def _generate_single_completion_with_tools(
+        self, model: PreTrainedModel, prompt_inputs: dict[str, torch.Tensor], max_steps: int = 10
+    ) -> torch.Tensor:
+        """Iterates between generation and tool calling.
+
+        Note this is currently only called from the non-vLLM path
+
+        prompt_inputs is a dict with the following keys:
+        - input_ids: [1, 710] ints.  Some stuff at the beginning and the end, the middle full of 151655
+        - attention_mask: [1, 710] ints.  All 1
+        - pixel_values: 2024x1176 floats.  The image.
+        - image_grid_thw: a 1x3 tensor with values: [1, 46, 44].
+        (Note that 46*44 is 2024).
+        """
+        conv = SingleConversationWithTools(prompt_inputs, self.tool_defn, self.processing_class)
+        # Loop until tool isn't called, of we max out
+        for step in range(max_steps):
+            if VERBOSE:
+                print(f"\n\n\nGenerating completion with tool call.  Step {step}.  Shapes of inputs:")
+                for key, val in prompt_inputs.items():
+                    print(f"{key}: {val.shape}")
+                print(f"Text of the prompt: {self.processing_class.decode(prompt_inputs['input_ids'][0])}")
+            prompt_completion_ids = self._generate_completion(model, prompt_inputs)
+            # prompt_completion_ids is a tensor of shape (1, L) Because we only generated one completion.
+            # Note that L includes both the prompt and the response.
+            # We only want to process the response, so we'll strip the prompt.
+            input_length = len(prompt_inputs["input_ids"][0])
+            ids_to_process = prompt_completion_ids[:, input_length:]
+            tool_was_used = conv.process_response(ids_to_process)
+            if not tool_was_used:
+                break
+
+        if VERBOSE:
+            just_completion_ids = conv.get_just_completion_ids()
+            print(f"\n\n\nDONE!")
+            print(f"Text of the response: {self.processing_class.decode(just_completion_ids[0,:])}")
+            print(f"^^^ I said DONE!\n\n\n\n\n\n")
+        return conv.get_prompt_completion_ids()
+
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
@@ -419,17 +549,17 @@ class QwenGRPOTrainer(Trainer):
             prompt_inputs_repeated = torch.repeat_interleave(prompt_inputs["input_ids"], self.num_generations, dim=0)
             prompt_completion_ids = torch.cat([prompt_inputs_repeated, completion_ids], dim=1)
         else:
-            # Regular generation path
+            # Regular generation path (not using vLLM)
             with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
                 # Generate N times, each generate one with the temp_generation_config
                 num_generations = self.generation_config.num_return_sequences
-                temp_generation_config = copy.deepcopy(self.generation_config)
-                temp_generation_config.num_return_sequences = 1
 
                 all_completions = []
-
                 for i in range(num_generations):
-                    completion = unwrapped_model.generate(**prompt_inputs, generation_config=temp_generation_config)
+                    if self.tool_defn:
+                        completion = self._generate_single_completion_with_tools(unwrapped_model, prompt_inputs)
+                    else:
+                        completion = self._generate_completion(unwrapped_model, prompt_inputs)
                     all_completions.append(completion)
                 
                 # Stack all completions and pad if needed
@@ -644,3 +774,4 @@ class QwenGRPOTrainer(Trainer):
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
+
