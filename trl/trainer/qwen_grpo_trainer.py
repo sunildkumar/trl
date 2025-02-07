@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-VERBOSE = False
 
 import os
 import textwrap
@@ -53,6 +52,7 @@ from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for
 from .grpo_config import GRPOConfig
 from .utils import generate_model_card, get_comet_experiment_url, pad
 
+VERBOSE = os.environ.get("VERBOSE", "false").lower() == "true"
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
@@ -98,7 +98,10 @@ class SingleConversationWithTools:
         # Check if the stop string is in the completions
         # We need to convert the tensor to a string.
         if self.tool_defn.completion_has_tool_call(prompt_completion_str):
-            tool_response_str = self.tool_defn.call_tool(prompt_completion_str)
+            try:
+                tool_response_str = self.tool_defn.call_tool(prompt_completion_str)
+            except Exception as e:
+                tool_response_str = f"Tool failed: {e}\n"
             tool_response_ids_list = self.processing_class.tokenizer.encode(tool_response_str, add_special_tokens=False)
             tool_response_ids = torch.tensor(tool_response_ids_list, device=prompt_completion_ids.device)  # [L]
             tool_response_ids = tool_response_ids[None, :]  # [1, L]
