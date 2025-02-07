@@ -52,7 +52,7 @@ from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for
 from .grpo_config import GRPOConfig
 from .utils import generate_model_card, get_comet_experiment_url, pad
 
-VERBOSE = os.environ.get("VERBOSE", "false").lower() == "true"
+VERBOSE = int(os.environ.get("VERBOSE", "0"))
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
@@ -116,7 +116,7 @@ class SingleConversationWithTools:
 
     def _add_response_to_prompt_inputs(self, prompt_inputs: dict[str, torch.Tensor], response: torch.Tensor) -> dict[str, torch.Tensor]:
         """Add the response to the prompt inputs."""
-        if VERBOSE:
+        if VERBOSE > 0:
             addition_str = self.processing_class.decode(response[0])
             print(f"Adding response: {addition_str}")
         prompt_inputs["input_ids"] = torch.cat([prompt_inputs["input_ids"], response], dim=1)
@@ -479,7 +479,7 @@ class QwenGRPOTrainer(Trainer):
         conv = SingleConversationWithTools(prompt_inputs, self.tool_defn, self.processing_class)
         # Loop until tool isn't called, of we max out
         for step in range(max_steps):
-            if VERBOSE:
+            if VERBOSE > 1:
                 print(f"\n\n\nGenerating completion with tool call.  Step {step}.  Shapes of inputs:")
                 for key, val in prompt_inputs.items():
                     print(f"{key}: {val.shape}")
@@ -494,12 +494,12 @@ class QwenGRPOTrainer(Trainer):
             if not tool_was_used:
                 break
 
-        if VERBOSE:
-            just_completion_ids = conv.get_just_completion_ids()
-            print(f"\n\n\nDONE!")
-            print(f"Text of the response: {self.processing_class.decode(just_completion_ids[0,:])}")
-            print(f"^^^ I said DONE!\n\n\n\n\n\n")
-        return conv.get_prompt_completion_ids()
+        full_completion = conv.get_prompt_completion_ids()
+        if VERBOSE > 0:
+            print(f"\nDONE!")
+            print(f"Final completion (with prompt):\n{self.processing_class.decode(full_completion[0,:])}")
+            print(f"^^^ Final Response!\n\n\n\n\n\n")
+        return full_completion
 
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
