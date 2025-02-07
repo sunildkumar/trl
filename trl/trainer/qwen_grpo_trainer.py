@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import time
 import os
 import textwrap
 import warnings
@@ -372,7 +372,7 @@ class QwenGRPOTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
-
+        
         device = self.accelerator.device
         prompt_inputs, prompts = self.tokenize_and_inject_images(inputs=inputs, processing_class=self.processing_class)
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
@@ -383,7 +383,7 @@ class QwenGRPOTrainer(Trainer):
                 print(f"Truncating prompt from {original_length} to {self.max_prompt_length} tokens")
             prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -self.max_prompt_length :]
             prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -self.max_prompt_length :]
-
+        
         # Generate completions using either vLLM or regular generation
         if self.args.use_vllm:
             print("You are using vLLM for inference. This probably won't work as I fixed this yet to work with VLM")
