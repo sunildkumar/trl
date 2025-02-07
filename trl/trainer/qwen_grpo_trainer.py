@@ -582,6 +582,8 @@ class QwenGRPOTrainer(Trainer):
 
                 # Stack all padded completions
                 prompt_completion_ids = torch.cat(padded_completions, dim=0)
+                if VERBOSE > 0:
+                    print(f"Done generating {num_generations} completions.")
 
         prompt_length = prompt_inputs["input_ids"].size(1)
         completion_ids = prompt_completion_ids[:, prompt_length:]
