@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-VERBOSE = True
+VERBOSE = False
 
 import os
 import textwrap
@@ -122,10 +122,15 @@ class SingleConversationWithTools:
         return prompt_inputs
 
 
-    def get_response(self) -> torch.Tensor:
-        """Returns the response as a tensor."""
+    def get_just_completion_ids(self) -> torch.Tensor:
+        """Returns the response (not including the prompt) as a tensor."""
         # String together all the response tensors on their long dimension.
         return torch.cat(self.response, dim=1)
+
+    def get_prompt_completion_ids(self) -> torch.Tensor:
+        """Returns the prompt and completion as a tensor.  The full completion includes the prompt and the response."""
+        out = torch.cat([self.prompt_inputs["input_ids"], self.get_just_completion_ids()], dim=1)
+        return out
 
 class QwenGRPOTrainer(Trainer):
     """
@@ -480,16 +485,19 @@ class QwenGRPOTrainer(Trainer):
             # prompt_completion_ids is a tensor of shape (1, L) Because we only generated one completion.
             # Note that L includes both the prompt and the response.
             # We only want to process the response, so we'll strip the prompt.
-            ids_to_process = prompt_completion_ids[:, len(prompt_inputs["input_ids"][0]):]
+            input_length = len(prompt_inputs["input_ids"][0])
+            ids_to_process = prompt_completion_ids[:, input_length:]
             tool_was_used = conv.process_response(ids_to_process)
             if not tool_was_used:
                 break
 
-        response_ids = conv.get_response()
         if VERBOSE:
+            just_completion_ids = conv.get_just_completion_ids()
             print(f"\n\n\nDONE!")
-            print(f"Text of the response: {self.processing_class.decode(response_ids[0,:])}")
-        return response_ids
+            print(f"Text of the response: {self.processing_class.decode(just_completion_ids[0,:])}")
+            print(f"^^^ I said DONE!\n\n\n\n\n\n")
+        return conv.get_prompt_completion_ids()
+
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
