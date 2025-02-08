@@ -174,3 +174,8 @@ class GRPOConfig(TrainingArguments):
         default=0.04,
         metadata={"help": "KL coefficient."},
     )
+
+    loss_magnifier: float = field(
+        default=1.0e4,
+        metadata={"help": "Multiplies the loss on the way out to avoid underflow."},
+    )

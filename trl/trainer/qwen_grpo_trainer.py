@@ -13,14 +13,15 @@
 # limitations under the License.
 
 
-import os
-import textwrap
-import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 from unittest.mock import patch
 import copy
+import math
+import os
+import textwrap
+import warnings
 
 import torch
 import torch.utils.data
@@ -217,6 +218,10 @@ class QwenGRPOTrainer(Trainer):
             model and a scheduler given by [`get_linear_schedule_with_warmup`] controlled by `args`.
         peft_config ([`~peft.PeftConfig`], *optional*, defaults to `None`):
             PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
+        tool_defn ([`~trl.ToolDefinition`], *optional*, defaults to `None`):
+            Tool definition used to define the tool call.
+        loss_magnifier (float, *optional*, defaults to 1000.0):
+            Multiplies the loss on the way out to avoid underflow.
     """
 
     _tag_names = ["trl", "grpo"]
@@ -235,6 +240,7 @@ class QwenGRPOTrainer(Trainer):
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
         tool_defn: Optional[ToolDefinition] = None,
+        loss_magnifier: float = 1.0e4,
     ):
         # Args
         if args is None:
@@ -323,6 +329,7 @@ class QwenGRPOTrainer(Trainer):
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
         self.use_vllm = args.use_vllm
+        self.loss_magnifier = args.loss_magnifier
 
         self.beta = args.beta
 
@@ -677,6 +684,12 @@ class QwenGRPOTrainer(Trainer):
         per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        # We could break this down like this:
+        #loss = (per_token_loss * completion_mask).sum(dim=1)  # Now we have a [B] tensor of losses for each example
+        #loss = loss / completion_mask.sum(dim=1)  # normalize by number of unmasked tokens. Still [B]
+        #loss = loss.mean()  # average across the batch.
+        # Rescale to avoid underflow - we see losses underflow to 0 when they're around 1e-7, which is common
+        loss = loss * self.loss_magnifier
 
         # Log the metrics
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
@@ -780,3 +793,7 @@ class QwenGRPOTrainer(Trainer):
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
 
+
+
+def simple_stats(x) -> str:
+    return f"Min: {x.min()}, Mean: {x.mean()}, Max: {x.max()}"
