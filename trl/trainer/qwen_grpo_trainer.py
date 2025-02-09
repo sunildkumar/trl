@@ -220,7 +220,7 @@ class QwenGRPOTrainer(Trainer):
             PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
         tool_defn ([`~trl.ToolDefinition`], *optional*, defaults to `None`):
             Tool definition used to define the tool call.
-        loss_magnifier (float, *optional*, defaults to 1000.0):
+        loss_magnifier (float, *optional*, defaults to 1.0):
             Multiplies the loss on the way out to avoid underflow.
     """
 
@@ -240,7 +240,7 @@ class QwenGRPOTrainer(Trainer):
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
         tool_defn: Optional[ToolDefinition] = None,
-        loss_magnifier: float = 1.0e4,
+        loss_magnifier: float = 1.0,
     ):
         # Args
         if args is None:
