@@ -176,6 +176,6 @@ class GRPOConfig(TrainingArguments):
     )
 
     loss_magnifier: float = field(
-        default=1.0e4,
+        default=1.0,
         metadata={"help": "Multiplies the loss on the way out to avoid underflow."},
     )
